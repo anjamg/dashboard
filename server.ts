@@ -62,21 +62,75 @@ async function startServer() {
         const { team, agent, from, to } = req.query;
         
         let where = "WHERE 1=1";
+        let where_data = "WHERE 1=1";
         const params: any[] = [];
-        if (from) { where += " AND date >= ?"; params.push(from); }
-        if (to) { where += " AND date <= ?"; params.push(to); }
-        if (team) { where += " AND team_name = ?"; params.push(team); }
-        if (agent) { where += " AND user = ?"; params.push(agent); }
+        const params_data: any[] = [];
+
+        if (from) { 
+            where += " AND date >= ?"; params.push(from); 
+            where_data += " AND date_only >= ?"; params_data.push(from);
+        }
+        if (to) { 
+            where += " AND date <= ?"; params.push(to); 
+            where_data += " AND date_only <= ?"; params_data.push(to);
+        }
+        if (team) { 
+            where += " AND team_name = ?"; params.push(team); 
+            where_data += " AND team_name = ?"; params_data.push(team);
+        }
+        if (agent) { 
+            where += " AND user = ?"; params.push(agent); 
+            where_data += " AND user = ?"; params_data.push(agent);
+        }
 
         try {
+            if (action === 'debug_data') {
+                const [rows] = await pool.execute("DESC data");
+                return res.json(rows);
+            }
+
+            if (action === 'debug') {
+                const debugInfo: any = {};
+                try {
+                    const [columns] = await pool.execute("SELECT TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE COLUMN_NAME LIKE '%tag%' AND TABLE_SCHEMA = DATABASE()");
+                    debugInfo.columns = columns;
+                } catch (e: any) { debugInfo.columns_error = e.message; }
+
+                try {
+                    const [tables] = await pool.execute("SHOW TABLES");
+                    debugInfo.tables = tables;
+                } catch (e: any) { debugInfo.tables_error = e.message; }
+
+                try {
+                    const [dataSample] = await pool.execute("SELECT * FROM data LIMIT 1");
+                    debugInfo.dataSample = dataSample;
+                } catch (e: any) { debugInfo.dataSample_error = e.message; }
+
+                return res.json(debugInfo);
+            }
+
             if (action === 'overview') {
                 const stats = await getStats(where, params);
                 return res.json(stats);
             }
             
             if (action === 'tags') {
-                const [rows] = await pool.execute(`SELECT tags as tag, COUNT(*) as count FROM v_stats_all ${where} AND tags IS NOT NULL AND tags != '' GROUP BY tags ORDER BY count DESC LIMIT 10`, params);
-                return res.json(rows);
+                const [rows] = await pool.execute(`SELECT tags FROM data ${where_data} AND tags IS NOT NULL AND tags != ''`, params_data);
+                const allTags: Record<string, number> = {};
+                (rows as any[]).forEach(row => {
+                    if (row.tags) {
+                        const parts = row.tags.split('/');
+                        parts.forEach((p: string) => {
+                            const trimmed = p.trim();
+                            if (trimmed) allTags[trimmed] = (allTags[trimmed] || 0) + 1;
+                        });
+                    }
+                });
+                const sorted = Object.entries(allTags)
+                    .sort((a, b) => b[1] - a[1])
+                    .slice(0, 10)
+                    .map(([tag, count]) => ({ tag, count }));
+                return res.json(sorted);
             }
 
             if (action === 'agents') {
@@ -90,17 +144,31 @@ async function startServer() {
             }
 
             if (action === 'calls') {
-                const [rows] = await pool.execute(`SELECT date, time, user as agent, line_name as line, direction, answered, duration_total as duration, waiting_time, tags FROM v_stats_all ${where} ORDER BY date DESC, time DESC LIMIT 100`, params);
+                const [rows] = await pool.execute(`SELECT date_only as date, HOUR(datetime_tz_offset_incl) as time, user as agent, line as line, direction, answered, duration_total_sec as duration, waiting_time_sec as waiting_time, tags FROM data ${where_data} ORDER BY date_only DESC, datetime_tz_offset_incl DESC LIMIT 100`, params_data);
                 return res.json(rows);
             }
 
             if (action === 'tags_by_team') {
-                const [rows] = await pool.execute(`SELECT team_name, tags as tag, COUNT(*) as count FROM v_stats_all ${where} AND tags IS NOT NULL AND tags != '' GROUP BY team_name, tags ORDER BY team_name, count DESC`, params);
-                const result: any = {};
+                const [rows] = await pool.execute(`SELECT team_name, tags FROM data ${where_data} AND tags IS NOT NULL AND tags != ''`, params_data);
+                const teamTags: Record<string, Record<string, number>> = {};
                 (rows as any[]).forEach(row => {
-                    if (!result[row.team_name]) result[row.team_name] = [];
-                    if (result[row.team_name].length < 5) result[row.team_name].push({ tag: row.tag, count: row.count });
+                    const team = row.team_name;
+                    if (!teamTags[team]) teamTags[team] = {};
+                    if (row.tags) {
+                        const parts = row.tags.split('/');
+                        parts.forEach((p: string) => {
+                            const trimmed = p.trim();
+                            if (trimmed) teamTags[team][trimmed] = (teamTags[team][trimmed] || 0) + 1;
+                        });
+                    }
                 });
+                const result: any = {};
+                for (const [team, tags] of Object.entries(teamTags)) {
+                    result[team] = Object.entries(tags)
+                        .sort((a, b) => b[1] - a[1])
+                        .slice(0, 5)
+                        .map(([tag, count]) => ({ tag, count }));
+                }
                 return res.json(result);
             }
 

@@ -29,7 +29,26 @@ if (isset($_GET['action'])) {
         if ($team) { $where .= " AND team_name = :team"; $params[':team'] = $team; }
         if ($agent) { $where .= " AND user = :agent"; $params[':agent'] = $agent; }
 
+        // Clause WHERE spécifique pour la table 'data' (qui utilise date_only)
+        $where_data = "WHERE date_only >= :from AND date_only <= :to";
+        if ($team) { $where_data .= " AND team_name = :team"; }
+        if ($agent) { $where_data .= " AND user = :agent"; }
+
         switch ($action) {
+            case 'debug_tags':
+                $sql = "SELECT TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE COLUMN_NAME LIKE '%tag%' AND TABLE_SCHEMA = DATABASE()";
+                $stmt = $pdo->query($sql);
+                echo json_encode($stmt->fetchAll());
+                break;
+
+            case 'debug_data':
+                $sql = "DESC data";
+                $stmt = $pdo->query($sql);
+                $res = $stmt->fetchAll();
+                file_put_contents('debug_output.txt', print_r($res, true));
+                echo json_encode($res);
+                break;
+
             case 'overview':
                 $sql = "SELECT COUNT(*) as total_calls, SUM(direction='inbound' AND answered=1) as answered, AVG(waiting_time) as avg_wait FROM v_stats_all $where";
                 $stmt = $pdo->prepare($sql);
@@ -46,17 +65,36 @@ if (isset($_GET['action'])) {
                 break;
 
             case 'heatmap':
-                $sql = "SELECT DAYOFWEEK(date) as day, HOUR(time) as hour, COUNT(*) as count FROM v_stats_all $where GROUP BY day, hour";
+                // Utilisation des colonnes réelles de v_stats_all
+                $sql = "SELECT weekday as day, hour_local as hour, COUNT(*) as count FROM v_stats_all $where GROUP BY day, hour";
                 $stmt = $pdo->prepare($sql);
                 $stmt->execute($params);
                 echo json_encode($stmt->fetchAll());
                 break;
 
             case 'tags':
-                $sql = "SELECT tags as tag, COUNT(*) as count FROM v_stats_all $where AND tags IS NOT NULL AND tags != '' GROUP BY tags ORDER BY count DESC LIMIT 10";
-                $stmt = $pdo->prepare($sql);
-                $stmt->execute($params);
-                echo json_encode($stmt->fetchAll());
+                try {
+                    // On utilise 'tags' (pluriel) et 'date_only' selon le schema.sql
+                    $sql = "SELECT tags FROM data $where_data AND tags IS NOT NULL AND tags != ''";
+                    $stmt = $pdo->prepare($sql);
+                    $stmt->execute($params);
+                    $all_tags = [];
+                    while ($row = $stmt->fetch()) {
+                        $parts = explode('/', $row['tags']);
+                        foreach ($parts as $p) {
+                            $p = trim($p);
+                            if ($p) $all_tags[$p] = ($all_tags[$p] ?? 0) + 1;
+                        }
+                    }
+                    arsort($all_tags);
+                    $res = [];
+                    foreach (array_slice($all_tags, 0, 10) as $tag => $count) {
+                        $res[] = ['tag' => $tag, 'count' => $count];
+                    }
+                    echo json_encode($res);
+                } catch (Exception $e) {
+                    echo json_encode(['error' => $e->getMessage(), 'action' => 'tags']);
+                }
                 break;
 
             case 'agents':
@@ -74,23 +112,38 @@ if (isset($_GET['action'])) {
                 break;
 
             case 'calls':
-                $sql = "SELECT date, time, user as agent, line_name as line, direction, answered, duration_total as duration, waiting_time, tags FROM v_stats_all $where ORDER BY date DESC, time DESC LIMIT 100";
+                // On utilise la table 'data' avec les colonnes du schema.sql
+                $sql = "SELECT date_only as date, HOUR(datetime_tz_offset_incl) as time, user as agent, line as line, direction, answered, duration_total_sec as duration, waiting_time_sec as waiting_time, tags FROM data $where_data ORDER BY date_only DESC, datetime_tz_offset_incl DESC LIMIT 100";
                 $stmt = $pdo->prepare($sql);
                 $stmt->execute($params);
                 echo json_encode($stmt->fetchAll());
                 break;
 
             case 'tags_by_team':
-                $sql = "SELECT team_name, tags as tag, COUNT(*) as count FROM v_stats_all $where AND tags IS NOT NULL AND tags != '' GROUP BY team_name, tags ORDER BY team_name, count DESC";
-                $stmt = $pdo->prepare($sql);
-                $stmt->execute($params);
-                $rows = $stmt->fetchAll();
-                $res = [];
-                foreach($rows as $row) {
-                    if (!isset($res[$row['team_name']])) $res[$row['team_name']] = [];
-                    if (count($res[$row['team_name']]) < 5) $res[$row['team_name']][] = ['tag' => $row['tag'], 'count' => $row['count']];
+                try {
+                    $sql = "SELECT team_name, tags FROM data $where_data AND tags IS NOT NULL AND tags != ''";
+                    $stmt = $pdo->prepare($sql);
+                    $stmt->execute($params);
+                    $team_tags = [];
+                    while ($row = $stmt->fetch()) {
+                        $team = $row['team_name'];
+                        $parts = explode('/', $row['tags']);
+                        foreach ($parts as $p) {
+                            $p = trim($p);
+                            if ($p) $team_tags[$team][$p] = ($team_tags[$team][$p] ?? 0) + 1;
+                        }
+                    }
+                    $res = [];
+                    foreach ($team_tags as $team => $tags) {
+                        arsort($tags);
+                        foreach (array_slice($tags, 0, 5) as $tag => $count) {
+                            $res[$team][] = ['tag' => $tag, 'count' => $count];
+                        }
+                    }
+                    echo json_encode($res);
+                } catch (Exception $e) {
+                    echo json_encode(['error' => $e->getMessage(), 'action' => 'tags_by_team']);
                 }
-                echo json_encode($res);
                 break;
                 
             case 'upload':
