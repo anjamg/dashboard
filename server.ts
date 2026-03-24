@@ -57,20 +57,71 @@ async function startServer() {
     };
 
     // --- MOCK PHP API FOR PREVIEW ---
-    // Cette route intercepte les appels vers /api/index.php pour que la prévisualisation fonctionne
     app.all('/api/index.php', async (req, res) => {
         const action = req.query.action || req.body.action;
+        const { team, agent, from, to } = req.query;
         
-        if (action === 'overview') {
-            const stats = await getStats("WHERE 1=1", []);
-            return res.json(stats);
-        }
-        
-        if (action === 'ai_analyze') {
-            return res.json({ analysis: "Analyse simulée (le serveur de test ne supporte pas le PHP en natif)." });
-        }
+        let where = "WHERE 1=1";
+        const params: any[] = [];
+        if (from) { where += " AND date >= ?"; params.push(from); }
+        if (to) { where += " AND date <= ?"; params.push(to); }
+        if (team) { where += " AND team_name = ?"; params.push(team); }
+        if (agent) { where += " AND user = ?"; params.push(agent); }
 
-        res.json({ error: "Action non reconnue dans le simulateur PHP" });
+        try {
+            if (action === 'overview') {
+                const stats = await getStats(where, params);
+                return res.json(stats);
+            }
+            
+            if (action === 'tags') {
+                const [rows] = await pool.execute(`SELECT tags as tag, COUNT(*) as count FROM v_stats_all ${where} AND tags IS NOT NULL AND tags != '' GROUP BY tags ORDER BY count DESC LIMIT 10`, params);
+                return res.json(rows);
+            }
+
+            if (action === 'agents') {
+                const [rows] = await pool.execute(`SELECT user as agent, team_name as team, COUNT(*) as total, SUM(answered=1) as answered, SUM(direction='outbound') as outbound, ROUND(SUM(answered=1)*100/COUNT(*), 1) as rate, AVG(duration_total) as avg_duration FROM v_stats_all ${where} GROUP BY user, team_name ORDER BY total DESC`, params);
+                return res.json(rows);
+            }
+
+            if (action === 'teams_stats') {
+                const [rows] = await pool.execute(`SELECT team_name as team, COUNT(*) as total, SUM(answered=1) as answered, SUM(direction='outbound') as outbound, SUM(answered=0 AND direction='inbound') as missed, AVG(duration_total) as avg_duration, COUNT(DISTINCT user) as agents_count FROM v_stats_all ${where} GROUP BY team_name`, params);
+                return res.json(rows);
+            }
+
+            if (action === 'calls') {
+                const [rows] = await pool.execute(`SELECT date, time, user as agent, line_name as line, direction, answered, duration_total as duration, waiting_time, tags FROM v_stats_all ${where} ORDER BY date DESC, time DESC LIMIT 100`, params);
+                return res.json(rows);
+            }
+
+            if (action === 'tags_by_team') {
+                const [rows] = await pool.execute(`SELECT team_name, tags as tag, COUNT(*) as count FROM v_stats_all ${where} AND tags IS NOT NULL AND tags != '' GROUP BY team_name, tags ORDER BY team_name, count DESC`, params);
+                const result: any = {};
+                (rows as any[]).forEach(row => {
+                    if (!result[row.team_name]) result[row.team_name] = [];
+                    if (result[row.team_name].length < 5) result[row.team_name].push({ tag: row.tag, count: row.count });
+                });
+                return res.json(result);
+            }
+
+            if (action === 'filters') {
+                const [teams] = await pool.execute("SELECT DISTINCT team_name FROM v_stats_all WHERE team_name IS NOT NULL ORDER BY team_name");
+                const [agents] = await pool.execute("SELECT DISTINCT user FROM v_stats_all WHERE user IS NOT NULL ORDER BY user");
+                return res.json({ 
+                    teams: (teams as any[]).map(t => t.team_name), 
+                    agents: (agents as any[]).map(a => a.user) 
+                });
+            }
+            
+            if (action === 'ai_analyze') {
+                return res.json({ analysis: "Analyse IA disponible uniquement avec une clé API configurée." });
+            }
+
+            res.json({ error: "Action non reconnue : " + action });
+        } catch (e) {
+            console.error("Erreur API Simulator:", e);
+            res.status(500).json({ error: "Erreur serveur BDD" });
+        }
     });
 
     // --- API ROUTES (Node.js native) ---
